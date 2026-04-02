@@ -2,19 +2,25 @@
 
 An interactive macOS disk space cleaner that runs entirely in your terminal. Zero dependencies — just Python 3.6+ and macOS.
 
-## Quick Start
+## Install
 
 ```bash
-# Clone and run
+pip install git+https://github.com/raghut/mac-disk-cleaner-cli.git
+```
+
+Then run it from anywhere:
+
+```bash
+disk-cleaner
+disk-cleaner --dry-run
+```
+
+### Or run without installing
+
+```bash
 git clone https://github.com/raghut/mac-disk-cleaner-cli.git
 cd mac-disk-cleaner-cli
 python3 disk_cleaner.py
-```
-
-### Dry Run (preview without deleting)
-
-```bash
-python3 disk_cleaner.py --dry-run
 ```
 
 ## What It Scans
@@ -54,7 +60,7 @@ python3 disk_cleaner.py --dry-run
 ## Usage
 
 ```
-$ python3 disk_cleaner.py
+$ disk-cleaner
 
 🔍 Scanning your disk...
 
@@ -80,7 +86,7 @@ Within a category, you can:
 
 - **macOS** (uses macOS-specific paths and `open` command)
 - **Python 3.6+** (ships with macOS)
-- No `pip install` needed
+- No third-party dependencies
 
 ## License
 
