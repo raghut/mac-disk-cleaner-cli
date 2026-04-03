@@ -42,6 +42,12 @@ python3 disk_cleaner.py
 | 13 | Large home folders | Review | Items > 500 MB in Documents, Downloads, Desktop, Movies |
 | 14 | Large personal files | Review | Large .mp4, .mov, .dmg, .iso, .zip files |
 | 15 | Installed applications | Review | All apps in `/Applications` |
+| 16 | Browser caches | Yes | Chrome, Safari, Firefox, Edge caches |
+| 17 | System caches (>100 MB) | Review | `/Library/Caches` entries > 100 MB (sudo) |
+| 18 | Tmp files (>50 MB) | Review | `/tmp` (`/private/tmp`) entries > 50 MB |
+| 19 | Var logs (>50 MB) | Review | `/private/var/log` entries > 50 MB (sudo) |
+| 20 | APFS snapshots | Review | Local Time Machine snapshots (sudo) |
+| 21 | Swap / sleep image | Info | `/private/var/vm` swap files and sleep image (restart to reclaim) |
 
 **Safe** = caches/derived data that will be regenerated automatically.
 **Review** = may contain data you want to keep — inspect before deleting.
@@ -55,7 +61,9 @@ python3 disk_cleaner.py
 - **Range selection** — select items with `1,3-5,7` syntax
 - **Pre-deletion summary** — review every item and its full path before confirming
 - **Size-sorted** — items shown largest-first so you can prioritize
-- **15 scan categories** — from dev caches to iOS backups
+- **21 scan categories** — from dev caches to system-level temp files
+- **Back navigation** — type `b` to return to the main menu from any category
+- **System-level scans** — browser caches, `/Library/Caches`, `/tmp`, `/var/log`, APFS snapshots, swap/sleep (some require sudo)
 
 ## Usage
 
@@ -79,6 +87,7 @@ $ disk-cleaner
 
 Within a category, you can:
 - Select items: `1,2` or `1-5` or `all` or `none`
+- Go back: `b` (return to the main category menu)
 - Reveal in Finder: `r3` (opens item #3 in Finder)
 - See full paths for every item before confirming deletion
 

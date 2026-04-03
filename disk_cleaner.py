@@ -20,6 +20,7 @@ from typing import List, Tuple, Optional
 
 HOME = pathlib.Path.home()
 DRY_RUN = False
+BACK_SENTINEL = "__BACK__"
 
 # ─────────────────────────────────────────────
 # Utility functions
@@ -192,11 +193,13 @@ def pick_items(items: List[Tuple[pathlib.Path, int, str]]) -> List[Tuple[pathlib
     print()
     while True:
         try:
-            raw = input("    Select items (e.g. 1,2 / 1-5 / 'all' / 'none' / 'r3' to reveal): ").strip()
+            raw = input("    Select items (e.g. 1,2 / 1-5 / 'all' / 'none' / 'b' back / 'r3' to reveal): ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return []
         low = raw.lower()
+        if low in ("b", "back"):
+            return BACK_SENTINEL
         # Handle reveal command
         reveal_match = re.match(r'^r(?:eveal)?\s*(\d+)$', low)
         if reveal_match:
@@ -594,6 +597,132 @@ def scan_old_ios_backups() -> List[Tuple[pathlib.Path, int, str]]:
     return results
 
 
+def scan_browser_caches() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan browser cache directories in ~/Library/Caches."""
+    browsers = [
+        (HOME / "Library/Caches/Google/Chrome",                  "Chrome cache"),
+        (HOME / "Library/Caches/Google/Chrome/Default/Cache",    "Chrome default cache"),
+        (HOME / "Library/Caches/com.apple.Safari",               "Safari cache"),
+        (HOME / "Library/Caches/Firefox",                        "Firefox cache"),
+        (HOME / "Library/Caches/com.microsoft.edgemac",          "Edge cache"),
+    ]
+    results = []
+    for path, label in browsers:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_system_caches(min_mb: int = 100) -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan /Library/Caches for entries larger than min_mb."""
+    caches_dir = pathlib.Path("/Library/Caches")
+    if not caches_dir.exists():
+        return []
+    threshold = min_mb * 1_048_576
+    results = []
+    try:
+        for entry in caches_dir.iterdir():
+            if entry.is_symlink():
+                continue
+            size = get_size(entry)
+            if size >= threshold:
+                results.append((entry, size, f"System cache: {entry.name}"))
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_tmp_files(min_mb: int = 50) -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan /tmp (/private/tmp) for entries larger than min_mb."""
+    tmp_dir = pathlib.Path("/private/tmp")
+    if not tmp_dir.exists():
+        return []
+    threshold = min_mb * 1_048_576
+    results = []
+    seen = set()
+    try:
+        for entry in tmp_dir.iterdir():
+            if entry.is_symlink():
+                continue
+            resolved = entry.resolve()
+            if str(resolved) in seen:
+                continue
+            seen.add(str(resolved))
+            size = get_size(entry)
+            if size >= threshold:
+                results.append((entry, size, f"Tmp: {entry.name}"))
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_var_logs(min_mb: int = 50) -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan /private/var/log for entries larger than min_mb."""
+    log_dir = pathlib.Path("/private/var/log")
+    if not log_dir.exists():
+        return []
+    threshold = min_mb * 1_048_576
+    results = []
+    try:
+        for entry in log_dir.iterdir():
+            if entry.is_symlink():
+                continue
+            size = get_size(entry)
+            if size >= threshold:
+                results.append((entry, size, f"Var log: {entry.name}"))
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_apfs_snapshots() -> List[Tuple[pathlib.Path, int, str]]:
+    """List APFS local snapshots via tmutil."""
+    output = run_cmd(["tmutil", "listlocalSnapshots", "/"])
+    if not output:
+        return []
+    results = []
+    for line in output.strip().splitlines():
+        line = line.strip()
+        # Lines look like "com.apple.TimeMachine.2024-01-15-123456.local"
+        # or just the date portion depending on macOS version
+        if not line:
+            continue
+        # Extract snapshot name (the date part)
+        match = re.search(r'(\d{4}-\d{2}-\d{2}-\d+)', line)
+        if match:
+            snap_name = match.group(1)
+            # Use a sentinel path with the snapshot name
+            results.append((pathlib.Path(f"__snapshot__{snap_name}"), 0, f"APFS snapshot: {snap_name}"))
+    return results
+
+
+def scan_swap_sleep() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan VM swap files and sleep image (info-only)."""
+    vm_dir = pathlib.Path("/private/var/vm")
+    if not vm_dir.exists():
+        return []
+    results = []
+    try:
+        for entry in vm_dir.iterdir():
+            if entry.name.startswith("swapfile") or entry.name == "sleepimage":
+                try:
+                    size = entry.stat().st_size
+                    if size > 0:
+                        results.append((entry, size, f"VM: {entry.name}"))
+                except (PermissionError, OSError):
+                    pass
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
 # ─────────────────────────────────────────────
 # Deletion functions
 # ─────────────────────────────────────────────
@@ -645,6 +774,56 @@ def delete_trash(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         return 0
 
 
+def delete_with_sudo(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
+    """Delete files/dirs using sudo. Returns total bytes freed."""
+    freed = 0
+    for path, size, label in selected:
+        print(f"  Deleting {label} ({format_size(size)})... ", end="", flush=True)
+        if DRY_RUN:
+            print("[dry-run]")
+            freed += size
+            continue
+        flag = "-rf" if path.is_dir() else "-f"
+        result = subprocess.run(
+            ["sudo", "rm", flag, str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            freed += size
+            print("done")
+        else:
+            print(f"failed: {result.stderr.strip()}")
+    return freed
+
+
+def delete_apfs_snapshots(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
+    """Delete APFS local snapshots via tmutil. Returns total bytes freed."""
+    freed = 0
+    for path, size, label in selected:
+        # The path name stores the snapshot date string
+        snap_name = path.name
+        print(f"  Deleting snapshot {snap_name} ({format_size(size)})... ", end="", flush=True)
+        if DRY_RUN:
+            print("[dry-run]")
+            freed += size
+            continue
+        result = subprocess.run(
+            ["sudo", "tmutil", "deletelocalsnapshots", snap_name],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            freed += size
+            print("done")
+        else:
+            print(f"failed: {result.stderr.strip()}")
+    return freed
+
+
+def delete_info_only(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
+    """Info-only placeholder — these items are freed on restart."""
+    return 0
+
+
 def delete_applications(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     """Delete apps using osascript (Finder trash) to handle permissions."""
     freed = 0
@@ -693,6 +872,12 @@ def build_categories() -> List[dict]:
         ("Large home folders",       scan_large_home_folders,   False, delete_paths),
         ("Large personal files",     scan_large_personal_files, False, delete_paths),
         ("Installed applications",   scan_applications,         False, delete_applications),
+        ("Browser caches",           scan_browser_caches,       True,  delete_paths),
+        ("System caches (>100 MB)",  scan_system_caches,        False, delete_with_sudo),
+        ("Tmp files (>50 MB)",       scan_tmp_files,            False, delete_paths),
+        ("Var logs (>50 MB)",        scan_var_logs,             False, delete_with_sudo),
+        ("APFS snapshots",           scan_apfs_snapshots,       False, delete_apfs_snapshots),
+        ("Swap / sleep image",       scan_swap_sleep,           False, delete_info_only),
     ]
 
     for name, scanner, safe, deleter in steps:
@@ -744,78 +929,107 @@ def main() -> None:
 
     categories = build_categories()
 
-    print()
-    print_summary_table(categories)
-
-    while True:
-        try:
-            raw = input("  Select categories to clean (e.g. 1,2,3 or 'all' or 'q' to quit): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            return
-
-        if raw.lower() in ("q", "quit", "exit"):
-            print("  Goodbye.")
-            return
-
-        selected_indices = parse_category_selection(raw, len(categories))
-        if not selected_indices:
-            print("  No valid categories selected. Try again or 'q' to quit.\n")
-            continue
-        break
-
     total_freed = 0
 
-    for idx in selected_indices:
-        cat = categories[idx]
-        print(f"\n{'─' * 65}")
-        print(f"  Category: {cat['name']}  ({format_size(cat['total_size'])} reclaimable)")
-        print(f"{'─' * 65}")
-
-        items = cat["items"]
-        if not items:
-            print("  Nothing found in this category.")
-            continue
-
-        # Docker uses its own selection flow
-        if cat["deleter"] is delete_docker:
-            print(f"  Docker usage breakdown:")
-            for path, size, label in items:
-                print(f"    • {label}: {format_size(size)}")
-            print()
-            freed = delete_docker(items)
-            total_freed += freed
-            if freed:
-                print(f"  Freed ~{format_size(freed)}")
-            continue
-
-        selected_items = pick_items(items)
-        if not selected_items:
-            print("  Nothing selected, skipping.")
-            continue
-
-        total_sel = sum(s for _, s, _ in selected_items)
-        print(f"\n  Items to delete ({len(selected_items)} item(s), {bold(format_size(total_sel))}):")
-        for path, size, label in selected_items:
-            print(f"    • {label} ({bold(format_size(size))})")
-            print(f"      {dim(hyperlink(path))}")
+    while True:
         print()
-        if not confirm("  Proceed?"):
-            print("  Skipped.")
+        print_summary_table(categories)
+
+        while True:
+            try:
+                raw = input("  Select categories to clean (e.g. 1,2,3 or 'all' or 'q' to quit): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Aborted.")
+                return
+
+            if raw.lower() in ("q", "quit", "exit"):
+                print("  Goodbye.")
+                if total_freed:
+                    print(f"\n{'═' * 65}")
+                    if DRY_RUN:
+                        print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+                    else:
+                        print(f"  Total freed: {format_size(total_freed)}")
+                        new_usage = shutil.disk_usage(HOME)
+                        print(f"  Disk free now: {format_size(new_usage.free)} / {format_size(new_usage.total)}")
+                    print(f"{'═' * 65}\n")
+                return
+
+            selected_indices = parse_category_selection(raw, len(categories))
+            if not selected_indices:
+                print("  No valid categories selected. Try again or 'q' to quit.\n")
+                continue
+            break
+
+        went_back = False
+
+        for idx in selected_indices:
+            cat = categories[idx]
+            print(f"\n{'─' * 65}")
+            print(f"  Category: {cat['name']}  ({format_size(cat['total_size'])} reclaimable)")
+            print(f"{'─' * 65}")
+
+            items = cat["items"]
+            if not items:
+                print("  Nothing found in this category.")
+                continue
+
+            # Docker uses its own selection flow
+            if cat["deleter"] is delete_docker:
+                print(f"  Docker usage breakdown:")
+                for path, size, label in items:
+                    print(f"    • {label}: {format_size(size)}")
+                print()
+                freed = delete_docker(items)
+                total_freed += freed
+                if freed:
+                    print(f"  Freed ~{format_size(freed)}")
+                continue
+
+            # Info-only categories (e.g. swap/sleep) — display and skip
+            if cat["deleter"] is delete_info_only:
+                for path, size, label in items:
+                    print(f"    • {label}: {format_size(size)}")
+                print()
+                print("  These items are freed automatically on restart. No action taken.")
+                continue
+
+            selected_items = pick_items(items)
+            if selected_items is BACK_SENTINEL:
+                went_back = True
+                break
+            if not selected_items:
+                print("  Nothing selected, skipping.")
+                continue
+
+            total_sel = sum(s for _, s, _ in selected_items)
+            print(f"\n  Items to delete ({len(selected_items)} item(s), {bold(format_size(total_sel))}):")
+            for path, size, label in selected_items:
+                print(f"    • {label} ({bold(format_size(size))})")
+                print(f"      {dim(hyperlink(path))}")
+            print()
+            if not confirm("  Proceed?"):
+                print("  Skipped.")
+                continue
+
+            freed = cat["deleter"](selected_items)
+            total_freed += freed
+            print(f"  Freed {format_size(freed)}")
+
+        if went_back:
+            print("\n  Returning to main menu...\n")
             continue
 
-        freed = cat["deleter"](selected_items)
-        total_freed += freed
-        print(f"  Freed {format_size(freed)}")
-
-    print(f"\n{'═' * 65}")
-    if DRY_RUN:
-        print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
-    else:
-        print(f"  Total freed: {format_size(total_freed)}")
-        new_usage = shutil.disk_usage(HOME)
-        print(f"  Disk free now: {format_size(new_usage.free)} / {format_size(new_usage.total)}")
-    print(f"{'═' * 65}\n")
+        # Finished all selected categories without going back
+        print(f"\n{'═' * 65}")
+        if DRY_RUN:
+            print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+        else:
+            print(f"  Total freed: {format_size(total_freed)}")
+            new_usage = shutil.disk_usage(HOME)
+            print(f"  Disk free now: {format_size(new_usage.free)} / {format_size(new_usage.total)}")
+        print(f"{'═' * 65}\n")
+        return
 
 
 if __name__ == "__main__":
