@@ -16,6 +16,11 @@ import json
 import datetime
 from typing import List, Tuple, Optional
 
+try:
+    import disk_cleaner_schedule
+except ImportError:
+    disk_cleaner_schedule = None
+
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
@@ -1292,6 +1297,115 @@ def print_info() -> None:
 """)
 
 
+def interactive_schedule_setup(config: dict) -> None:
+    """Interactive schedule configuration from the main menu."""
+    if disk_cleaner_schedule is None:
+        print("  Schedule module not found. Reinstall disk-cleaner to enable scheduling.")
+        return
+
+    print(f"\n{'─' * 65}")
+    print("  Auto-Clean Setup")
+    print(f"{'─' * 65}\n")
+
+    print("  Frequency:")
+    print("    [1] Daily")
+    print("    [2] Weekly")
+    print("    [3] Monthly")
+    while True:
+        try:
+            freq_input = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if freq_input == "1":
+            frequency = "daily"
+            break
+        elif freq_input == "2":
+            frequency = "weekly"
+            break
+        elif freq_input == "3":
+            frequency = "monthly"
+            break
+        print("  Please enter 1, 2, or 3.")
+
+    day = "sunday"
+    if frequency == "weekly":
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        print("\n  Day:")
+        for i, d in enumerate(day_names, 1):
+            print(f"    [{i}] {d.capitalize()}")
+        while True:
+            try:
+                day_input = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.")
+                return
+            try:
+                day_idx = int(day_input) - 1
+                if 0 <= day_idx < 7:
+                    day = day_names[day_idx]
+                    break
+            except ValueError:
+                pass
+            print("  Please enter 1-7.")
+
+    print("\n  Time (24h format, e.g. 03:00):")
+    while True:
+        try:
+            time_input = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if len(time_input) >= 3 and ":" in time_input:
+            try:
+                h, m = [int(x) for x in time_input.split(":")]
+                if 0 <= h <= 23 and 0 <= m <= 59:
+                    time_str = f"{h:02d}:{m:02d}"
+                    break
+            except ValueError:
+                pass
+        print("  Please enter time in HH:MM format (e.g. 03:00).")
+
+    print("\n  Categories that will be auto-cleaned (safe only):")
+    safe_names = [
+        "Trash", "Dev caches", "Xcode caches", "Android SDK (old)",
+        "JetBrains / IDE", "VS Code caches", "Language toolchains",
+        "System logs", "Saved app state", "Browser caches",
+        "iCloud local cache", "Diagnostic reports", "CocoaPods cache",
+        "Composer cache (PHP)", "Ruby gems cache", "NuGet cache (.NET)",
+    ]
+    for name in safe_names:
+        print(f"    [ok] {name}")
+
+    print()
+    if not confirm("  Include all safe categories?"):
+        print("  Cancelled.")
+        return
+
+    config["schedule"] = {
+        "enabled": True,
+        "frequency": frequency,
+        "day": day,
+        "time": time_str,
+        "categories": "safe-only",
+    }
+    save_config(config)
+
+    if disk_cleaner_schedule.install_schedule(config):
+        freq_display = frequency
+        if frequency == "weekly":
+            freq_display = f"every {day.capitalize()}"
+        elif frequency == "monthly":
+            freq_display = "monthly (1st)"
+        print(f"\n  Schedule installed: {freq_display} at {time_str}")
+        print(f"  Plist: ~/Library/LaunchAgents/com.diskcleaner.auto.plist")
+        print(f"  Logs:  ~/Library/Logs/DiskCleaner/")
+        log_action(f"Schedule installed: {freq_display} at {time_str}")
+    else:
+        print("\n  Failed to install schedule.")
+    print()
+
+
 def run_auto_clean() -> None:
     """Non-interactive mode: clean only safe categories, skip sudo, log everything."""
     global DRY_RUN
@@ -1337,11 +1451,57 @@ def main() -> None:
                         help="Show what would be deleted without actually deleting anything")
     parser.add_argument("--auto-clean", action="store_true",
                         help="Run non-interactive cleanup of safe categories only (used by scheduler)")
+    parser.add_argument("--schedule", nargs="?", const="interactive", default=None,
+                        metavar="FREQ",
+                        help="Set up auto-clean schedule (daily/weekly/monthly or interactive)")
+    parser.add_argument("--day", default="sunday",
+                        help="Day for weekly schedule (default: sunday)")
+    parser.add_argument("--time", default="03:00", dest="schedule_time",
+                        help="Time for schedule in HH:MM format (default: 03:00)")
+    parser.add_argument("--unschedule", action="store_true",
+                        help="Remove auto-clean schedule")
+    parser.add_argument("--schedule-status", action="store_true",
+                        help="Show current auto-clean schedule status")
     args = parser.parse_args()
     DRY_RUN = args.dry_run
 
     if args.auto_clean:
         run_auto_clean()
+        return
+
+    if args.schedule_status:
+        if disk_cleaner_schedule:
+            disk_cleaner_schedule.show_schedule_status()
+        else:
+            print("  Schedule module not available.")
+        return
+
+    if args.unschedule:
+        if disk_cleaner_schedule:
+            disk_cleaner_schedule.uninstall_schedule()
+            log_action("Schedule removed")
+        else:
+            print("  Schedule module not available.")
+        return
+
+    if args.schedule is not None:
+        config = init_config()
+        if args.schedule == "interactive":
+            interactive_schedule_setup(config)
+            return
+        config["schedule"] = {
+            "enabled": True,
+            "frequency": args.schedule,
+            "day": args.day,
+            "time": args.schedule_time,
+            "categories": "safe-only",
+        }
+        save_config(config)
+        if disk_cleaner_schedule and disk_cleaner_schedule.install_schedule(config):
+            print(f"  Schedule installed: {args.schedule} at {args.schedule_time}")
+            log_action(f"Schedule installed: {args.schedule} at {args.schedule_time}")
+        else:
+            print("  Failed to install schedule.")
         return
 
     config = init_config()
@@ -1367,7 +1527,7 @@ def main() -> None:
         selected_indices = None
         while selected_indices is None:
             try:
-                raw = input("  Select categories (e.g. 1,2 / 'all' / 'a' show all / 'i' info / 'q' quit): ").strip()
+                raw = input("  Select categories (e.g. 1,2 / 'all' / 'a' show all / 's' schedule / 'i' info / 'q' quit): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n  Aborted.")
                 return
@@ -1395,6 +1555,10 @@ def main() -> None:
 
             if low == "i":
                 print_info()
+                continue
+
+            if low == "s":
+                interactive_schedule_setup(config)
                 continue
 
             # Parse selection against visible categories
