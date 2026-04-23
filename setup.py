@@ -2,13 +2,13 @@ from setuptools import setup
 
 setup(
     name="mac-disk-cleaner-cli",
-    version="1.0.0",
+    version="2.0.0",
     description="Interactive macOS disk space cleaner CLI",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="raghut",
     url="https://github.com/raghut/mac-disk-cleaner-cli",
-    py_modules=["disk_cleaner"],
+    py_modules=["disk_cleaner", "disk_cleaner_schedule"],
     entry_points={
         "console_scripts": [
             "disk-cleaner=disk_cleaner:main",
