@@ -1292,6 +1292,40 @@ def print_info() -> None:
 """)
 
 
+def run_auto_clean() -> None:
+    """Non-interactive mode: clean only safe categories, skip sudo, log everything."""
+    global DRY_RUN
+
+    config = init_config()
+    cleanup_old_logs(config.get("log_retention_days", 30))
+
+    log_action("AUTO-CLEAN started")
+    print("Auto-clean: scanning...")
+
+    categories = build_categories()
+
+    total_freed = 0
+    for cat in categories:
+        if not cat["safe"]:
+            continue
+        if not cat["items"]:
+            continue
+        # Skip categories that require sudo (can't prompt in auto mode)
+        if cat["deleter"] in (delete_with_sudo, delete_spotlight_rebuild, delete_apfs_snapshots):
+            log_action(f"Skipped: {cat['name']} (requires sudo)")
+            continue
+
+        freed = cat["deleter"](cat["items"])
+        total_freed += freed
+        if freed:
+            log_action(f"Cleaned: {cat['name']} — freed {format_size(freed)}")
+
+    usage = shutil.disk_usage(HOME)
+    summary = f"AUTO-CLEAN complete — freed {format_size(total_freed)} — disk free: {format_size(usage.free)} / {format_size(usage.total)}"
+    log_action(summary)
+    print(f"  {summary}")
+
+
 def main() -> None:
     global DRY_RUN
 
@@ -1301,8 +1335,14 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be deleted without actually deleting anything")
+    parser.add_argument("--auto-clean", action="store_true",
+                        help="Run non-interactive cleanup of safe categories only (used by scheduler)")
     args = parser.parse_args()
     DRY_RUN = args.dry_run
+
+    if args.auto_clean:
+        run_auto_clean()
+        return
 
     config = init_config()
     cleanup_old_logs(config.get("log_retention_days", 30))
