@@ -1094,6 +1094,28 @@ def delete_info_only(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     return 0
 
 
+def delete_spotlight_rebuild(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
+    """Rebuild Spotlight index via mdutil instead of deleting files."""
+    total = sum(s for _, s, _ in selected)
+    if DRY_RUN:
+        print("  [dry-run] would run: sudo mdutil -E /")
+        return total
+    if not confirm("  This will rebuild the Spotlight index (sudo mdutil -E /). Spotlight will be temporarily unavailable."):
+        return 0
+    result = subprocess.run(
+        ["sudo", "mdutil", "-E", "/"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode == 0:
+        print("  Spotlight index rebuild started.")
+        log_action(f"Deleted: Spotlight index rebuild — {format_size(total)}")
+        return total
+    else:
+        print(f"  Spotlight rebuild failed: {result.stderr.strip()}")
+        log_action(f"Failed: Spotlight rebuild — {result.stderr.strip()}")
+        return 0
+
+
 def delete_applications(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     """Delete apps using osascript (Finder trash) to handle permissions."""
     freed = 0
