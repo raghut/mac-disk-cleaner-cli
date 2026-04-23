@@ -1151,35 +1151,82 @@ def build_categories() -> List[dict]:
     """Run all scanners and return category list."""
     categories = []
 
+    # Format: (name, scanner, safe, deleter, hint)
     steps = [
-        ("Trash",                    scan_trash,                True,  delete_trash),
-        ("Dev caches",               scan_dev_caches,           True,  delete_paths),
-        ("Xcode caches",             scan_xcode,                True,  delete_paths),
-        ("Android SDK (old)",        scan_android_sdk,          True,  delete_paths),
-        ("JetBrains / IDE",          scan_jetbrains,            True,  delete_paths),
-        ("VS Code caches",           scan_vscode,               True,  delete_paths),
-        ("Language toolchains",      scan_language_toolchains,  True,  delete_paths),
-        ("System logs",              scan_system_logs,          True,  delete_paths),
-        ("Saved app state",          scan_saved_app_state,      True,  delete_paths),
-        ("App caches (>100 MB)",     scan_app_caches,           False, delete_paths),
-        ("Docker",                   scan_docker,               False, delete_docker),
-        ("iOS backups",              scan_old_ios_backups,      False, delete_paths),
-        ("Large home folders",       scan_large_home_folders,   False, delete_paths),
-        ("Large personal files",     scan_large_personal_files, False, delete_paths),
-        ("Installed applications",   scan_applications,         False, delete_applications),
-        ("Browser caches",           scan_browser_caches,       True,  delete_paths),
-        ("System caches (>100 MB)",  scan_system_caches,        False, delete_with_sudo),
-        ("Tmp files (>50 MB)",       scan_tmp_files,            False, delete_paths),
-        ("Var logs (>50 MB)",        scan_var_logs,             False, delete_with_sudo),
-        ("APFS snapshots",           scan_apfs_snapshots,       False, delete_apfs_snapshots),
-        ("Swap / sleep image",       scan_swap_sleep,           False, delete_info_only),
+        ("Trash",                    scan_trash,                   True,  delete_trash,
+         "Safe to delete — empties your Trash bin."),
+        ("Dev caches",               scan_dev_caches,              True,  delete_paths,
+         "Safe to delete — package managers will re-download as needed."),
+        ("Xcode caches",             scan_xcode,                   True,  delete_paths,
+         "Safe to delete — Xcode rebuilds these on next build."),
+        ("Android SDK (old)",        scan_android_sdk,             True,  delete_paths,
+         "Safe to delete — old SDK versions no longer in use."),
+        ("JetBrains / IDE",          scan_jetbrains,               True,  delete_paths,
+         "Safe to delete — old IDE version caches."),
+        ("VS Code caches",           scan_vscode,                  True,  delete_paths,
+         "Safe to delete — VS Code rebuilds caches on restart."),
+        ("Language toolchains",      scan_language_toolchains,     True,  delete_paths,
+         "Safe to delete — package caches and old compiler versions."),
+        ("System logs",              scan_system_logs,             True,  delete_paths,
+         "Safe to delete — old log files no longer needed."),
+        ("Saved app state",          scan_saved_app_state,         True,  delete_paths,
+         "Safe to delete — app window state, regenerated on launch."),
+        ("App caches (>100 MB)",     scan_app_caches,              False, delete_paths,
+         "Review before deleting — app-specific caches, some may slow down apps temporarily."),
+        ("Docker",                   scan_docker,                  False, delete_docker,
+         "Review — removes unused images, containers, networks, and build cache."),
+        ("iOS backups",              scan_old_ios_backups,         False, delete_paths,
+         "Review carefully — device backups cannot be recovered once deleted."),
+        ("Large home folders",       scan_large_home_folders,      False, delete_paths,
+         "Review carefully — large items in Documents/Downloads/Desktop/Movies."),
+        ("Large personal files",     scan_large_personal_files,    False, delete_paths,
+         "Review carefully — large media files, disk images, and archives."),
+        ("Installed applications",   scan_applications,            False, delete_applications,
+         "Review — uninstall apps you no longer use."),
+        ("Browser caches",           scan_browser_caches,          True,  delete_paths,
+         "Safe to delete — browsers rebuild their cache automatically. Refills within 1-2 days."),
+        ("System caches (>100 MB)",  scan_system_caches,           False, delete_with_sudo,
+         "Review — system-level caches, requires sudo. Some may slow down apps temporarily."),
+        ("Tmp files (>50 MB)",       scan_tmp_files,               False, delete_paths,
+         "Review — temporary files that may still be in use by running processes."),
+        ("Var logs (>50 MB)",        scan_var_logs,                False, delete_with_sudo,
+         "Review — system log files, requires sudo."),
+        ("APFS snapshots",           scan_apfs_snapshots,          False, delete_apfs_snapshots,
+         "Review — Time Machine local snapshots. Deleting saves space but removes restore points."),
+        ("Swap / sleep image",       scan_swap_sleep,              False, delete_info_only,
+         "Info only — these are freed automatically on restart. Cannot be deleted while running."),
+        # New categories
+        ("Mail attachments",         scan_mail_attachments,        False, delete_paths,
+         "Review — large email attachments. Deleting removes local copies only if using IMAP."),
+        ("iCloud local cache",       scan_icloud_cache,            True,  delete_paths,
+         "Safe to delete — iCloud re-downloads files as you access them. Refills over time."),
+        ("Diagnostic reports",       scan_diagnostic_reports,      True,  delete_paths,
+         "Safe to delete — crash logs and diagnostic data. Accumulates silently over time."),
+        ("Core dumps",               scan_core_dumps,              True,  delete_with_sudo,
+         "Safe to delete — process crash dumps, often multi-GB each."),
+        ("Software updates",         scan_software_updates,        False, delete_with_sudo,
+         "Review — macOS update staging files. Safe if no update is in progress."),
+        ("ASL logs",                 scan_asl_logs,                True,  delete_with_sudo,
+         "Safe to delete — Apple System Logs, continuously regenerated. Refills daily."),
+        ("Spotlight index",          scan_spotlight,               False, delete_spotlight_rebuild,
+         "Review — rebuilds search index. Spotlight unavailable temporarily during rebuild."),
+        ("Xcode simulator caches",   scan_xcode_simulator_caches, False, delete_paths,
+         "Review — simulator runtime caches. Re-downloaded when needed."),
+        ("CocoaPods cache",          scan_cocoapods_cache,         True,  delete_paths,
+         "Safe to delete — CocoaPods re-downloads pods on next install."),
+        ("Composer cache (PHP)",     scan_composer_cache,          True,  delete_paths,
+         "Safe to delete — Composer re-downloads packages on next install."),
+        ("Ruby gems cache",          scan_ruby_gems_cache,         True,  delete_paths,
+         "Safe to delete — gems re-downloaded on next bundle install."),
+        ("NuGet cache (.NET)",       scan_nuget_cache,             True,  delete_paths,
+         "Safe to delete — NuGet re-downloads packages on next restore."),
     ]
 
-    for name, scanner, safe, deleter in steps:
+    for name, scanner, safe, deleter, hint in steps:
         spinner_print(f"Scanning {name}...")
         try:
             items = scanner()
-        except Exception as e:
+        except Exception:
             items = []
         total = sum(s for _, s, _ in items)
         spinner_done()
@@ -1189,6 +1236,7 @@ def build_categories() -> List[dict]:
             "total_size": total,
             "safe": safe,
             "deleter": deleter,
+            "hint": hint,
         })
 
     return categories
