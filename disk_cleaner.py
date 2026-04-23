@@ -796,6 +796,195 @@ def scan_swap_sleep() -> List[Tuple[pathlib.Path, int, str]]:
     return results
 
 
+def scan_mail_attachments(min_mb: int = 50) -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan ~/Library/Mail for large attachments."""
+    mail_dir = HOME / "Library/Mail"
+    if not mail_dir.exists():
+        return []
+    threshold = min_mb * 1_048_576
+    results = []
+    seen = set()
+
+    def _walk_mail(d: pathlib.Path, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        try:
+            for entry in d.iterdir():
+                if entry.is_symlink() or str(entry) in seen:
+                    continue
+                seen.add(str(entry))
+                if entry.is_file():
+                    try:
+                        size = entry.stat().st_size
+                        if size >= threshold:
+                            results.append((entry, size, f"Mail: {entry.name}"))
+                    except (PermissionError, OSError):
+                        pass
+                elif entry.is_dir():
+                    _walk_mail(entry, depth + 1)
+        except (PermissionError, OSError):
+            pass
+
+    _walk_mail(mail_dir)
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_icloud_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan iCloud-related caches."""
+    paths = [
+        (HOME / "Library/Caches/CloudKit",              "CloudKit cache"),
+        (HOME / "Library/Caches/com.apple.cloudd",      "iCloud daemon cache"),
+        (HOME / "Library/Caches/com.apple.bird",        "iCloud Documents cache"),
+    ]
+    results = []
+    for path, label in paths:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_diagnostic_reports() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan diagnostic/crash report directories."""
+    dirs = [
+        (HOME / "Library/Logs/DiagnosticReports",  "User diagnostic reports"),
+        (pathlib.Path("/Library/Logs/DiagnosticReports"), "System diagnostic reports"),
+    ]
+    results = []
+    for path, label in dirs:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_core_dumps() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan /cores/ for core dump files."""
+    cores_dir = pathlib.Path("/cores")
+    if not cores_dir.exists():
+        return []
+    results = []
+    try:
+        for entry in cores_dir.iterdir():
+            if entry.is_file() and entry.name.startswith("core."):
+                try:
+                    size = entry.stat().st_size
+                    if size > 0:
+                        results.append((entry, size, f"Core dump: {entry.name}"))
+                except (PermissionError, OSError):
+                    pass
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_software_updates() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan macOS software update staging files."""
+    dirs = [
+        (pathlib.Path("/Library/Updates"),                           "macOS Updates staging"),
+        (HOME / "Library/Caches/com.apple.SoftwareUpdate",          "SoftwareUpdate cache"),
+    ]
+    results = []
+    for path, label in dirs:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_asl_logs() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Apple System Logs at /private/var/log/asl/."""
+    asl_dir = pathlib.Path("/private/var/log/asl")
+    if not asl_dir.exists():
+        return []
+    size = get_size(asl_dir)
+    if size > 0:
+        return [(asl_dir, size, "Apple System Logs (ASL)")]
+    return []
+
+
+def scan_spotlight() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Spotlight index size. Offers rebuild, not delete."""
+    spotlight_dir = pathlib.Path("/.Spotlight-V100")
+    if not spotlight_dir.exists():
+        return []
+    size = get_size(spotlight_dir)
+    if size > 0:
+        return [(pathlib.Path("__spotlight__"), size, "Spotlight index (rebuild to reclaim)")]
+    return []
+
+
+def scan_xcode_simulator_caches() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Xcode simulator runtime caches."""
+    cache_dir = HOME / "Library/Developer/CoreSimulator/Caches"
+    if not cache_dir.exists():
+        return []
+    results = []
+    try:
+        for entry in cache_dir.iterdir():
+            if entry.is_symlink():
+                continue
+            size = get_size(entry)
+            if size > 0:
+                results.append((entry, size, f"Simulator cache: {entry.name}"))
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_cocoapods_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan CocoaPods cache."""
+    path = HOME / "Library/Caches/CocoaPods"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "CocoaPods cache")]
+    return []
+
+
+def scan_composer_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan PHP Composer cache."""
+    path = HOME / ".composer/cache"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "Composer cache")]
+    return []
+
+
+def scan_ruby_gems_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Ruby gems cache."""
+    path = HOME / ".gem"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "Ruby gems cache")]
+    return []
+
+
+def scan_nuget_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan .NET NuGet package cache."""
+    path = HOME / ".nuget/packages"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "NuGet package cache")]
+    return []
+
+
 # ─────────────────────────────────────────────
 # Deletion functions
 # ─────────────────────────────────────────────
