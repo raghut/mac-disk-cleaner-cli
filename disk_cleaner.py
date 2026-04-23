@@ -171,31 +171,50 @@ def print_header(free_bytes: int, total_bytes: int) -> None:
     print(f"\u2514{'─' * (width)}┘\n")
 
 
-def print_summary_table(categories: List[dict]) -> None:
+def print_summary_table(categories: List[dict], show_all: bool = False) -> List[int]:
+    """Print the category table. Returns mapping of display index to category index.
+    If show_all is False, hides categories with 0 items."""
     col_cat = 32
     col_found = 14
     col_size = 14
-    col_flag = 0
 
     header = f"  {'CATEGORY':<{col_cat}} {'FOUND':<{col_found}} {'RECLAIMABLE':<{col_size}}"
     print(header)
     print("  " + "─" * 70)
 
     total = 0
-    for i, cat in enumerate(categories, 1):
+    display_num = 0
+    hidden_count = 0
+    index_map = []  # display_index -> categories_index
+
+    for cat_idx, cat in enumerate(categories):
         name = cat["name"]
         items = cat["items"]
         size = cat["total_size"]
         safe = cat["safe"]
+
+        has_items = items is not None and len(items) > 0
+
+        if not show_all and not has_items:
+            hidden_count += 1
+            continue
+
+        display_num += 1
+        index_map.append(cat_idx)
         flag = "\u2705 auto-safe" if safe else "\u26a0\ufe0f  review"
         found_str = f"{len(items)} items" if items is not None else "-"
         size_str = format_size(size) if size else "0 B"
-        print(f"  [{i}] {name:<{col_cat - 4}} {found_str:<{col_found}} {size_str:<{col_size}} {flag}")
+        dimmed = "" if has_items else " (empty)"
+        print(f"  [{display_num}] {name:<{col_cat - 4}} {found_str:<{col_found}} {size_str:<{col_size}} {flag}{dimmed}")
         total += size
 
     print()
+    if hidden_count > 0:
+        print(f"  ({hidden_count} categories hidden — nothing found)")
     print(f"  Total reclaimable: ~{format_size(total)}")
     print()
+
+    return index_map
 
 
 def pick_items(items: List[Tuple[pathlib.Path, int, str]]) -> List[Tuple[pathlib.Path, int, str]]:
@@ -1250,6 +1269,29 @@ def parse_category_selection(raw: str, count: int) -> List[int]:
     return parse_selection(raw, count)
 
 
+def print_info() -> None:
+    """Print info about why disk fills up and how to use auto-clean."""
+    print(f"""
+{'─' * 65}
+  Why does my disk fill up again?
+{'─' * 65}
+  macOS and apps continuously regenerate caches, logs, and temp files.
+  The biggest culprits:
+
+  - Browser caches     — Chrome/Safari rebuild 2-5 GB within days
+  - System logs (ASL)  — macOS writes continuously, can grow to GBs
+  - Diagnostic reports — crash logs accumulate silently
+  - iCloud sync cache  — re-downloads files as you access them
+  - Spotlight index    — rebuilds after cache clears
+  - Swap/VM files      — grow under memory pressure (freed on restart)
+
+  To keep disk clean automatically, set up auto-clean:
+  From main menu: press 's' to configure a schedule
+  Or run: disk-cleaner --schedule weekly
+{'─' * 65}
+""")
+
+
 def main() -> None:
     global DRY_RUN
 
@@ -1276,19 +1318,23 @@ def main() -> None:
     categories = build_categories()
 
     total_freed = 0
+    show_all = False
 
     while True:
         print()
-        print_summary_table(categories)
+        index_map = print_summary_table(categories, show_all=show_all)
 
-        while True:
+        selected_indices = None
+        while selected_indices is None:
             try:
-                raw = input("  Select categories to clean (e.g. 1,2,3 or 'all' or 'q' to quit): ").strip()
+                raw = input("  Select categories (e.g. 1,2 / 'all' / 'a' show all / 'i' info / 'q' quit): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n  Aborted.")
                 return
 
-            if raw.lower() in ("q", "quit", "exit"):
+            low = raw.lower()
+
+            if low in ("q", "quit", "exit"):
                 print("  Goodbye.")
                 if total_freed:
                     print(f"\n{'═' * 65}")
@@ -1301,11 +1347,28 @@ def main() -> None:
                     print(f"{'═' * 65}\n")
                 return
 
-            selected_indices = parse_category_selection(raw, len(categories))
-            if not selected_indices:
+            if low == "a":
+                show_all = not show_all
+                print()
+                index_map = print_summary_table(categories, show_all=show_all)
+                continue
+
+            if low == "i":
+                print_info()
+                continue
+
+            # Parse selection against visible categories
+            if low == "all":
+                selected_display = list(range(len(index_map)))
+            else:
+                selected_display = parse_selection(low, len(index_map))
+
+            if not selected_display:
                 print("  No valid categories selected. Try again or 'q' to quit.\n")
                 continue
-            break
+
+            # Map display indices back to actual category indices
+            selected_indices = [index_map[d] for d in selected_display]
 
         went_back = False
 
@@ -1313,6 +1376,8 @@ def main() -> None:
             cat = categories[idx]
             print(f"\n{'─' * 65}")
             print(f"  Category: {cat['name']}  ({format_size(cat['total_size'])} reclaimable)")
+            if cat.get("hint"):
+                print(f"  {dim(cat['hint'])}")
             print(f"{'─' * 65}")
 
             items = cat["items"]
@@ -1324,7 +1389,7 @@ def main() -> None:
             if cat["deleter"] is delete_docker:
                 print(f"  Docker usage breakdown:")
                 for path, size, label in items:
-                    print(f"    • {label}: {format_size(size)}")
+                    print(f"    \u2022 {label}: {format_size(size)}")
                 print()
                 freed = delete_docker(items)
                 total_freed += freed
@@ -1335,7 +1400,7 @@ def main() -> None:
             # Info-only categories (e.g. swap/sleep) — display and skip
             if cat["deleter"] is delete_info_only:
                 for path, size, label in items:
-                    print(f"    • {label}: {format_size(size)}")
+                    print(f"    \u2022 {label}: {format_size(size)}")
                 print()
                 print("  These items are freed automatically on restart. No action taken.")
                 continue
@@ -1351,7 +1416,7 @@ def main() -> None:
             total_sel = sum(s for _, s, _ in selected_items)
             print(f"\n  Items to delete ({len(selected_items)} item(s), {bold(format_size(total_sel))}):")
             for path, size, label in selected_items:
-                print(f"    • {label} ({bold(format_size(size))})")
+                print(f"    \u2022 {label} ({bold(format_size(size))})")
                 print(f"      {dim(hyperlink(path))}")
             print()
             if not confirm("  Proceed?"):
@@ -1366,16 +1431,44 @@ def main() -> None:
             print("\n  Returning to main menu...\n")
             continue
 
-        # Finished all selected categories without going back
-        print(f"\n{'═' * 65}")
+        # Show round summary inline
+        print(f"\n{'─' * 65}")
         if DRY_RUN:
-            print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+            print(f"  [dry-run] Session total so far: {format_size(total_freed)}")
         else:
-            print(f"  Total freed: {format_size(total_freed)}")
+            print(f"  Session total freed so far: {format_size(total_freed)}")
             new_usage = shutil.disk_usage(HOME)
             print(f"  Disk free now: {format_size(new_usage.free)} / {format_size(new_usage.total)}")
-        print(f"{'═' * 65}\n")
-        return
+        print(f"{'─' * 65}")
+
+        # Post-round prompt — return to menu instead of exiting
+        while True:
+            try:
+                post = input("\n  Press 'r' to re-scan, 'q' to quit, or Enter to continue: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Aborted.")
+                return
+            if post in ("q", "quit"):
+                print("  Goodbye.")
+                if total_freed:
+                    print(f"\n{'═' * 65}")
+                    if DRY_RUN:
+                        print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+                    else:
+                        print(f"  Total freed: {format_size(total_freed)}")
+                        final_usage = shutil.disk_usage(HOME)
+                        print(f"  Disk free now: {format_size(final_usage.free)} / {format_size(final_usage.total)}")
+                    print(f"{'═' * 65}\n")
+                return
+            if post == "r":
+                print("\n\U0001f50d Re-scanning your disk...\n")
+                usage = shutil.disk_usage(HOME)
+                print_header(usage.free, usage.total)
+                categories = build_categories()
+                break
+            if post == "":
+                break
+            print("  Invalid input. Press 'r', Enter, or 'q'.")
 
 
 if __name__ == "__main__":
