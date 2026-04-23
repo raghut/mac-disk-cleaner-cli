@@ -12,6 +12,8 @@ import subprocess
 import pathlib
 import argparse
 import re
+import json
+import datetime
 from typing import List, Tuple, Optional
 
 # ─────────────────────────────────────────────
@@ -21,6 +23,21 @@ from typing import List, Tuple, Optional
 HOME = pathlib.Path.home()
 DRY_RUN = False
 BACK_SENTINEL = "__BACK__"
+
+CONFIG_DIR = HOME / ".disk-cleaner"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_DIR = HOME / "Library/Logs/DiskCleaner"
+
+DEFAULT_CONFIG = {
+    "schedule": {
+        "enabled": False,
+        "frequency": "weekly",
+        "day": "sunday",
+        "time": "03:00",
+        "categories": "safe-only",
+    },
+    "log_retention_days": 30,
+}
 
 # ─────────────────────────────────────────────
 # Utility functions
@@ -235,6 +252,62 @@ def spinner_print(msg: str) -> None:
 
 def spinner_done() -> None:
     print(" done")
+
+
+# ─────────────────────────────────────────────
+# Config & Logging
+# ─────────────────────────────────────────────
+
+def init_config() -> dict:
+    """Create config dir and default config.json if not present. Returns config."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
+        return dict(DEFAULT_CONFIG)
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(config: dict) -> None:
+    """Write config to disk."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def log_action(message: str) -> None:
+    """Append a timestamped line to today's log file."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.date.today().isoformat()
+    log_file = LOG_DIR / f"cleanup-{today}.log"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(log_file, "a") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def cleanup_old_logs(retention_days: int = 30) -> None:
+    """Delete log files older than retention_days."""
+    if not LOG_DIR.exists():
+        return
+    cutoff = datetime.date.today() - datetime.timedelta(days=retention_days)
+    try:
+        for entry in LOG_DIR.iterdir():
+            if not entry.name.startswith("cleanup-") or not entry.name.endswith(".log"):
+                continue
+            date_str = entry.name[len("cleanup-"):-len(".log")]
+            try:
+                file_date = datetime.date.fromisoformat(date_str)
+                if file_date < cutoff:
+                    entry.unlink()
+            except ValueError:
+                continue
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -735,8 +808,10 @@ def delete_paths(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if safe_delete(path):
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             print("failed")
+            log_action(f"Failed: {label} — {path}")
     return freed
 
 
@@ -753,9 +828,11 @@ def delete_docker(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     result = run_cmd(["docker", "system", "prune", "-af"])
     if result is not None:
         print("  Docker pruned successfully.")
+        log_action(f"Deleted: Docker prune — {format_size(sum(s for _, s, _ in selected))}")
         return sum(s for _, s, _ in selected)
     else:
         print("  Docker prune failed or docker not available.")
+        log_action("Failed: Docker prune")
         return 0
 
 
@@ -768,9 +845,11 @@ def delete_trash(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     result = run_cmd(["osascript", "-e", 'tell application "Finder" to empty trash'])
     if result is not None:
         print("  Trash emptied successfully.")
+        log_action(f"Deleted: Trash — {format_size(total)}")
         return total
     else:
         print("  Failed to empty Trash.")
+        log_action("Failed: Trash empty")
         return 0
 
 
@@ -791,8 +870,10 @@ def delete_with_sudo(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if result.returncode == 0:
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             print(f"failed: {result.stderr.strip()}")
+            log_action(f"Failed: {label} — {path} — {result.stderr.strip()}")
     return freed
 
 
@@ -838,13 +919,16 @@ def delete_applications(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if result is not None:
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             # Fallback: try direct rm
             if safe_delete(path):
                 freed += size
                 print("done (direct)")
+                log_action(f"Deleted: {label} — {format_size(size)} — {path}")
             else:
                 print("failed")
+                log_action(f"Failed: {label} — {path}")
     return freed
 
 
@@ -918,6 +1002,9 @@ def main() -> None:
                         help="Show what would be deleted without actually deleting anything")
     args = parser.parse_args()
     DRY_RUN = args.dry_run
+
+    config = init_config()
+    cleanup_old_logs(config.get("log_retention_days", 30))
 
     if DRY_RUN:
         print("\n  ** DRY-RUN MODE — nothing will be deleted **")
