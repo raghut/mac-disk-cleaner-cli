@@ -48,6 +48,18 @@ python3 disk_cleaner.py
 | 19 | Var logs (>50 MB) | Review | `/private/var/log` entries > 50 MB (sudo) |
 | 20 | APFS snapshots | Review | Local Time Machine snapshots (sudo) |
 | 21 | Swap / sleep image | Info | `/private/var/vm` swap files and sleep image (restart to reclaim) |
+| 22 | Mail attachments | Review | Large email attachments in `~/Library/Mail` |
+| 23 | iCloud local cache | Yes | `~/Library/Caches/CloudKit` and iCloud sync data |
+| 24 | Diagnostic reports | Yes | Crash logs in `~/Library/Logs/DiagnosticReports` and `/Library/Logs/DiagnosticReports` |
+| 25 | Core dumps | Yes | Process crash dumps in `/cores` (often multi-GB each) |
+| 26 | Software updates | Review | macOS update staging files in `/Library/Updates` |
+| 27 | ASL logs | Yes | Apple System Logs in `/private/var/log/asl` (regenerated daily) |
+| 28 | Spotlight index | Review | Spotlight search index — triggers rebuild after deletion |
+| 29 | Xcode simulator caches | Review | Simulator runtime caches, re-downloaded when needed |
+| 30 | CocoaPods cache | Yes | `~/Library/Caches/CocoaPods` — re-downloaded on next install |
+| 31 | Composer cache (PHP) | Yes | `~/.composer/cache` — re-downloaded on next install |
+| 32 | Ruby gems cache | Yes | `~/.gem` cache — re-downloaded on next bundle install |
+| 33 | NuGet cache (.NET) | Yes | `~/.nuget` cache — re-downloaded on next restore |
 
 **Safe** = caches/derived data that will be regenerated automatically.
 **Review** = may contain data you want to keep — inspect before deleting.
@@ -61,9 +73,32 @@ python3 disk_cleaner.py
 - **Range selection** — select items with `1,3-5,7` syntax
 - **Pre-deletion summary** — review every item and its full path before confirming
 - **Size-sorted** — items shown largest-first so you can prioritize
-- **21 scan categories** — from dev caches to system-level temp files
+- **33 scan categories** — from dev caches to system-level temp files
+- **Auto-clean mode** — `--auto-clean` silently cleans safe-only categories
+- **Scheduled cleaning** — set up automatic weekly/daily/monthly cleanup via launchd
+- **Auto-detect empty** — hides empty categories for a cleaner view; press `a` to show all
+- **In-app help** — press `i` for tips on why disk fills up and how to keep it clean
+- **Action logging** — all deletions logged to `~/Library/Logs/DiskCleaner/`
 - **Back navigation** — type `b` to return to the main menu from any category
 - **System-level scans** — browser caches, `/Library/Caches`, `/tmp`, `/var/log`, APFS snapshots, swap/sleep (some require sudo)
+
+## Auto-Clean Schedule
+
+Keep your disk clean automatically with scheduled runs that clean safe-only categories in the background using macOS launchd.
+
+```bash
+# Interactive setup from the main menu
+disk-cleaner        # then press 's'
+
+# Or configure from the command line
+disk-cleaner --schedule weekly          # install weekly schedule (Sundays 3am)
+disk-cleaner --schedule-status          # check current schedule
+disk-cleaner --unschedule               # remove schedule
+
+# One-off silent cleanup (safe categories only)
+disk-cleaner --auto-clean
+disk-cleaner --auto-clean --dry-run     # preview what auto-clean would delete
+```
 
 ## Usage
 
@@ -82,7 +117,7 @@ $ disk-cleaner
   [2] Dev caches                   9 items        9.1 GB         ✅ auto-safe
   ...
 
-  Select categories to clean (e.g. 1,2,3 or 'all' or 'q' to quit): 2
+  Select categories to clean (e.g. 1,2,3 / 'all' / 's' schedule / 'i' info / 'q' quit): 2
 ```
 
 Within a category, you can:
