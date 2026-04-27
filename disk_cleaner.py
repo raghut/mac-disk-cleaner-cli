@@ -12,7 +12,14 @@ import subprocess
 import pathlib
 import argparse
 import re
+import json
+import datetime
 from typing import List, Tuple, Optional
+
+try:
+    import disk_cleaner_schedule
+except ImportError:
+    disk_cleaner_schedule = None
 
 # ─────────────────────────────────────────────
 # Constants
@@ -21,6 +28,21 @@ from typing import List, Tuple, Optional
 HOME = pathlib.Path.home()
 DRY_RUN = False
 BACK_SENTINEL = "__BACK__"
+
+CONFIG_DIR = HOME / ".disk-cleaner"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_DIR = HOME / "Library/Logs/DiskCleaner"
+
+DEFAULT_CONFIG = {
+    "schedule": {
+        "enabled": False,
+        "frequency": "weekly",
+        "day": "sunday",
+        "time": "03:00",
+        "categories": "safe-only",
+    },
+    "log_retention_days": 30,
+}
 
 # ─────────────────────────────────────────────
 # Utility functions
@@ -154,31 +176,50 @@ def print_header(free_bytes: int, total_bytes: int) -> None:
     print(f"\u2514{'─' * (width)}┘\n")
 
 
-def print_summary_table(categories: List[dict]) -> None:
+def print_summary_table(categories: List[dict], show_all: bool = False) -> List[int]:
+    """Print the category table. Returns mapping of display index to category index.
+    If show_all is False, hides categories with 0 items."""
     col_cat = 32
     col_found = 14
     col_size = 14
-    col_flag = 0
 
     header = f"  {'CATEGORY':<{col_cat}} {'FOUND':<{col_found}} {'RECLAIMABLE':<{col_size}}"
     print(header)
     print("  " + "─" * 70)
 
     total = 0
-    for i, cat in enumerate(categories, 1):
+    display_num = 0
+    hidden_count = 0
+    index_map = []  # display_index -> categories_index
+
+    for cat_idx, cat in enumerate(categories):
         name = cat["name"]
         items = cat["items"]
         size = cat["total_size"]
         safe = cat["safe"]
+
+        has_items = items is not None and len(items) > 0
+
+        if not show_all and not has_items:
+            hidden_count += 1
+            continue
+
+        display_num += 1
+        index_map.append(cat_idx)
         flag = "\u2705 auto-safe" if safe else "\u26a0\ufe0f  review"
         found_str = f"{len(items)} items" if items is not None else "-"
         size_str = format_size(size) if size else "0 B"
-        print(f"  [{i}] {name:<{col_cat - 4}} {found_str:<{col_found}} {size_str:<{col_size}} {flag}")
+        dimmed = "" if has_items else " (empty)"
+        print(f"  [{display_num}] {name:<{col_cat - 4}} {found_str:<{col_found}} {size_str:<{col_size}} {flag}{dimmed}")
         total += size
 
     print()
+    if hidden_count > 0:
+        print(f"  ({hidden_count} categories hidden — nothing found)")
     print(f"  Total reclaimable: ~{format_size(total)}")
     print()
+
+    return index_map
 
 
 def pick_items(items: List[Tuple[pathlib.Path, int, str]]) -> List[Tuple[pathlib.Path, int, str]]:
@@ -235,6 +276,62 @@ def spinner_print(msg: str) -> None:
 
 def spinner_done() -> None:
     print(" done")
+
+
+# ─────────────────────────────────────────────
+# Config & Logging
+# ─────────────────────────────────────────────
+
+def init_config() -> dict:
+    """Create config dir and default config.json if not present. Returns config."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
+        return dict(DEFAULT_CONFIG)
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(config: dict) -> None:
+    """Write config to disk."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def log_action(message: str) -> None:
+    """Append a timestamped line to today's log file."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.date.today().isoformat()
+    log_file = LOG_DIR / f"cleanup-{today}.log"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(log_file, "a") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def cleanup_old_logs(retention_days: int = 30) -> None:
+    """Delete log files older than retention_days."""
+    if not LOG_DIR.exists():
+        return
+    cutoff = datetime.date.today() - datetime.timedelta(days=retention_days)
+    try:
+        for entry in LOG_DIR.iterdir():
+            if not entry.name.startswith("cleanup-") or not entry.name.endswith(".log"):
+                continue
+            date_str = entry.name[len("cleanup-"):-len(".log")]
+            try:
+                file_date = datetime.date.fromisoformat(date_str)
+                if file_date < cutoff:
+                    entry.unlink()
+            except ValueError:
+                continue
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -723,6 +820,195 @@ def scan_swap_sleep() -> List[Tuple[pathlib.Path, int, str]]:
     return results
 
 
+def scan_mail_attachments(min_mb: int = 50) -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan ~/Library/Mail for large attachments."""
+    mail_dir = HOME / "Library/Mail"
+    if not mail_dir.exists():
+        return []
+    threshold = min_mb * 1_048_576
+    results = []
+    seen = set()
+
+    def _walk_mail(d: pathlib.Path, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        try:
+            for entry in d.iterdir():
+                if entry.is_symlink() or str(entry) in seen:
+                    continue
+                seen.add(str(entry))
+                if entry.is_file():
+                    try:
+                        size = entry.stat().st_size
+                        if size >= threshold:
+                            results.append((entry, size, f"Mail: {entry.name}"))
+                    except (PermissionError, OSError):
+                        pass
+                elif entry.is_dir():
+                    _walk_mail(entry, depth + 1)
+        except (PermissionError, OSError):
+            pass
+
+    _walk_mail(mail_dir)
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_icloud_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan iCloud-related caches."""
+    paths = [
+        (HOME / "Library/Caches/CloudKit",              "CloudKit cache"),
+        (HOME / "Library/Caches/com.apple.cloudd",      "iCloud daemon cache"),
+        (HOME / "Library/Caches/com.apple.bird",        "iCloud Documents cache"),
+    ]
+    results = []
+    for path, label in paths:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_diagnostic_reports() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan diagnostic/crash report directories."""
+    dirs = [
+        (HOME / "Library/Logs/DiagnosticReports",  "User diagnostic reports"),
+        (pathlib.Path("/Library/Logs/DiagnosticReports"), "System diagnostic reports"),
+    ]
+    results = []
+    for path, label in dirs:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_core_dumps() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan /cores/ for core dump files."""
+    cores_dir = pathlib.Path("/cores")
+    if not cores_dir.exists():
+        return []
+    results = []
+    try:
+        for entry in cores_dir.iterdir():
+            if entry.is_file() and entry.name.startswith("core."):
+                try:
+                    size = entry.stat().st_size
+                    if size > 0:
+                        results.append((entry, size, f"Core dump: {entry.name}"))
+                except (PermissionError, OSError):
+                    pass
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_software_updates() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan macOS software update staging files."""
+    dirs = [
+        (pathlib.Path("/Library/Updates"),                           "macOS Updates staging"),
+        (HOME / "Library/Caches/com.apple.SoftwareUpdate",          "SoftwareUpdate cache"),
+    ]
+    results = []
+    for path, label in dirs:
+        if path.exists():
+            size = get_size(path)
+            if size > 0:
+                results.append((path, size, label))
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_asl_logs() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Apple System Logs at /private/var/log/asl/."""
+    asl_dir = pathlib.Path("/private/var/log/asl")
+    if not asl_dir.exists():
+        return []
+    size = get_size(asl_dir)
+    if size > 0:
+        return [(asl_dir, size, "Apple System Logs (ASL)")]
+    return []
+
+
+def scan_spotlight() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Spotlight index size. Offers rebuild, not delete."""
+    spotlight_dir = pathlib.Path("/.Spotlight-V100")
+    if not spotlight_dir.exists():
+        return []
+    size = get_size(spotlight_dir)
+    if size > 0:
+        return [(pathlib.Path("__spotlight__"), size, "Spotlight index (rebuild to reclaim)")]
+    return []
+
+
+def scan_xcode_simulator_caches() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Xcode simulator runtime caches."""
+    cache_dir = HOME / "Library/Developer/CoreSimulator/Caches"
+    if not cache_dir.exists():
+        return []
+    results = []
+    try:
+        for entry in cache_dir.iterdir():
+            if entry.is_symlink():
+                continue
+            size = get_size(entry)
+            if size > 0:
+                results.append((entry, size, f"Simulator cache: {entry.name}"))
+    except (PermissionError, OSError):
+        pass
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def scan_cocoapods_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan CocoaPods cache."""
+    path = HOME / "Library/Caches/CocoaPods"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "CocoaPods cache")]
+    return []
+
+
+def scan_composer_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan PHP Composer cache."""
+    path = HOME / ".composer/cache"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "Composer cache")]
+    return []
+
+
+def scan_ruby_gems_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan Ruby gems cache."""
+    path = HOME / ".gem"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "Ruby gems cache")]
+    return []
+
+
+def scan_nuget_cache() -> List[Tuple[pathlib.Path, int, str]]:
+    """Scan .NET NuGet package cache."""
+    path = HOME / ".nuget/packages"
+    if not path.exists():
+        return []
+    size = get_size(path)
+    if size > 0:
+        return [(path, size, "NuGet package cache")]
+    return []
+
+
 # ─────────────────────────────────────────────
 # Deletion functions
 # ─────────────────────────────────────────────
@@ -735,8 +1021,10 @@ def delete_paths(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if safe_delete(path):
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             print("failed")
+            log_action(f"Failed: {label} — {path}")
     return freed
 
 
@@ -753,9 +1041,11 @@ def delete_docker(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     result = run_cmd(["docker", "system", "prune", "-af"])
     if result is not None:
         print("  Docker pruned successfully.")
+        log_action(f"Deleted: Docker prune — {format_size(sum(s for _, s, _ in selected))}")
         return sum(s for _, s, _ in selected)
     else:
         print("  Docker prune failed or docker not available.")
+        log_action("Failed: Docker prune")
         return 0
 
 
@@ -768,9 +1058,11 @@ def delete_trash(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     result = run_cmd(["osascript", "-e", 'tell application "Finder" to empty trash'])
     if result is not None:
         print("  Trash emptied successfully.")
+        log_action(f"Deleted: Trash — {format_size(total)}")
         return total
     else:
         print("  Failed to empty Trash.")
+        log_action("Failed: Trash empty")
         return 0
 
 
@@ -791,8 +1083,10 @@ def delete_with_sudo(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if result.returncode == 0:
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             print(f"failed: {result.stderr.strip()}")
+            log_action(f"Failed: {label} — {path} — {result.stderr.strip()}")
     return freed
 
 
@@ -824,6 +1118,28 @@ def delete_info_only(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     return 0
 
 
+def delete_spotlight_rebuild(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
+    """Rebuild Spotlight index via mdutil instead of deleting files."""
+    total = sum(s for _, s, _ in selected)
+    if DRY_RUN:
+        print("  [dry-run] would run: sudo mdutil -E /")
+        return total
+    if not confirm("  This will rebuild the Spotlight index (sudo mdutil -E /). Spotlight will be temporarily unavailable."):
+        return 0
+    result = subprocess.run(
+        ["sudo", "mdutil", "-E", "/"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode == 0:
+        print("  Spotlight index rebuild started.")
+        log_action(f"Deleted: Spotlight index rebuild — {format_size(total)}")
+        return total
+    else:
+        print(f"  Spotlight rebuild failed: {result.stderr.strip()}")
+        log_action(f"Failed: Spotlight rebuild — {result.stderr.strip()}")
+        return 0
+
+
 def delete_applications(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
     """Delete apps using osascript (Finder trash) to handle permissions."""
     freed = 0
@@ -838,13 +1154,16 @@ def delete_applications(selected: List[Tuple[pathlib.Path, int, str]]) -> int:
         if result is not None:
             freed += size
             print("done")
+            log_action(f"Deleted: {label} — {format_size(size)} — {path}")
         else:
             # Fallback: try direct rm
             if safe_delete(path):
                 freed += size
                 print("done (direct)")
+                log_action(f"Deleted: {label} — {format_size(size)} — {path}")
             else:
                 print("failed")
+                log_action(f"Failed: {label} — {path}")
     return freed
 
 
@@ -856,35 +1175,82 @@ def build_categories() -> List[dict]:
     """Run all scanners and return category list."""
     categories = []
 
+    # Format: (name, scanner, safe, deleter, hint)
     steps = [
-        ("Trash",                    scan_trash,                True,  delete_trash),
-        ("Dev caches",               scan_dev_caches,           True,  delete_paths),
-        ("Xcode caches",             scan_xcode,                True,  delete_paths),
-        ("Android SDK (old)",        scan_android_sdk,          True,  delete_paths),
-        ("JetBrains / IDE",          scan_jetbrains,            True,  delete_paths),
-        ("VS Code caches",           scan_vscode,               True,  delete_paths),
-        ("Language toolchains",      scan_language_toolchains,  True,  delete_paths),
-        ("System logs",              scan_system_logs,          True,  delete_paths),
-        ("Saved app state",          scan_saved_app_state,      True,  delete_paths),
-        ("App caches (>100 MB)",     scan_app_caches,           False, delete_paths),
-        ("Docker",                   scan_docker,               False, delete_docker),
-        ("iOS backups",              scan_old_ios_backups,      False, delete_paths),
-        ("Large home folders",       scan_large_home_folders,   False, delete_paths),
-        ("Large personal files",     scan_large_personal_files, False, delete_paths),
-        ("Installed applications",   scan_applications,         False, delete_applications),
-        ("Browser caches",           scan_browser_caches,       True,  delete_paths),
-        ("System caches (>100 MB)",  scan_system_caches,        False, delete_with_sudo),
-        ("Tmp files (>50 MB)",       scan_tmp_files,            False, delete_paths),
-        ("Var logs (>50 MB)",        scan_var_logs,             False, delete_with_sudo),
-        ("APFS snapshots",           scan_apfs_snapshots,       False, delete_apfs_snapshots),
-        ("Swap / sleep image",       scan_swap_sleep,           False, delete_info_only),
+        ("Trash",                    scan_trash,                   True,  delete_trash,
+         "Safe to delete — empties your Trash bin."),
+        ("Dev caches",               scan_dev_caches,              True,  delete_paths,
+         "Safe to delete — package managers will re-download as needed."),
+        ("Xcode caches",             scan_xcode,                   True,  delete_paths,
+         "Safe to delete — Xcode rebuilds these on next build."),
+        ("Android SDK (old)",        scan_android_sdk,             True,  delete_paths,
+         "Safe to delete — old SDK versions no longer in use."),
+        ("JetBrains / IDE",          scan_jetbrains,               True,  delete_paths,
+         "Safe to delete — old IDE version caches."),
+        ("VS Code caches",           scan_vscode,                  True,  delete_paths,
+         "Safe to delete — VS Code rebuilds caches on restart."),
+        ("Language toolchains",      scan_language_toolchains,     True,  delete_paths,
+         "Safe to delete — package caches and old compiler versions."),
+        ("System logs",              scan_system_logs,             True,  delete_paths,
+         "Safe to delete — old log files no longer needed."),
+        ("Saved app state",          scan_saved_app_state,         True,  delete_paths,
+         "Safe to delete — app window state, regenerated on launch."),
+        ("App caches (>100 MB)",     scan_app_caches,              False, delete_paths,
+         "Review before deleting — app-specific caches, some may slow down apps temporarily."),
+        ("Docker",                   scan_docker,                  False, delete_docker,
+         "Review — removes unused images, containers, networks, and build cache."),
+        ("iOS backups",              scan_old_ios_backups,         False, delete_paths,
+         "Review carefully — device backups cannot be recovered once deleted."),
+        ("Large home folders",       scan_large_home_folders,      False, delete_paths,
+         "Review carefully — large items in Documents/Downloads/Desktop/Movies."),
+        ("Large personal files",     scan_large_personal_files,    False, delete_paths,
+         "Review carefully — large media files, disk images, and archives."),
+        ("Installed applications",   scan_applications,            False, delete_applications,
+         "Review — uninstall apps you no longer use."),
+        ("Browser caches",           scan_browser_caches,          True,  delete_paths,
+         "Safe to delete — browsers rebuild their cache automatically. Refills within 1-2 days."),
+        ("System caches (>100 MB)",  scan_system_caches,           False, delete_with_sudo,
+         "Review — system-level caches, requires sudo. Some may slow down apps temporarily."),
+        ("Tmp files (>50 MB)",       scan_tmp_files,               False, delete_paths,
+         "Review — temporary files that may still be in use by running processes."),
+        ("Var logs (>50 MB)",        scan_var_logs,                False, delete_with_sudo,
+         "Review — system log files, requires sudo."),
+        ("APFS snapshots",           scan_apfs_snapshots,          False, delete_apfs_snapshots,
+         "Review — Time Machine local snapshots. Deleting saves space but removes restore points."),
+        ("Swap / sleep image",       scan_swap_sleep,              False, delete_info_only,
+         "Info only — these are freed automatically on restart. Cannot be deleted while running."),
+        # New categories
+        ("Mail attachments",         scan_mail_attachments,        False, delete_paths,
+         "Review — large email attachments. Deleting removes local copies only if using IMAP."),
+        ("iCloud local cache",       scan_icloud_cache,            True,  delete_paths,
+         "Safe to delete — iCloud re-downloads files as you access them. Refills over time."),
+        ("Diagnostic reports",       scan_diagnostic_reports,      True,  delete_paths,
+         "Safe to delete — crash logs and diagnostic data. Accumulates silently over time."),
+        ("Core dumps",               scan_core_dumps,              True,  delete_with_sudo,
+         "Safe to delete — process crash dumps, often multi-GB each."),
+        ("Software updates",         scan_software_updates,        False, delete_with_sudo,
+         "Review — macOS update staging files. Safe if no update is in progress."),
+        ("ASL logs",                 scan_asl_logs,                True,  delete_with_sudo,
+         "Safe to delete — Apple System Logs, continuously regenerated. Refills daily."),
+        ("Spotlight index",          scan_spotlight,               False, delete_spotlight_rebuild,
+         "Review — rebuilds search index. Spotlight unavailable temporarily during rebuild."),
+        ("Xcode simulator caches",   scan_xcode_simulator_caches, False, delete_paths,
+         "Review — simulator runtime caches. Re-downloaded when needed."),
+        ("CocoaPods cache",          scan_cocoapods_cache,         True,  delete_paths,
+         "Safe to delete — CocoaPods re-downloads pods on next install."),
+        ("Composer cache (PHP)",     scan_composer_cache,          True,  delete_paths,
+         "Safe to delete — Composer re-downloads packages on next install."),
+        ("Ruby gems cache",          scan_ruby_gems_cache,         True,  delete_paths,
+         "Safe to delete — gems re-downloaded on next bundle install."),
+        ("NuGet cache (.NET)",       scan_nuget_cache,             True,  delete_paths,
+         "Safe to delete — NuGet re-downloads packages on next restore."),
     ]
 
-    for name, scanner, safe, deleter in steps:
+    for name, scanner, safe, deleter, hint in steps:
         spinner_print(f"Scanning {name}...")
         try:
             items = scanner()
-        except Exception as e:
+        except Exception:
             items = []
         total = sum(s for _, s, _ in items)
         spinner_done()
@@ -894,6 +1260,7 @@ def build_categories() -> List[dict]:
             "total_size": total,
             "safe": safe,
             "deleter": deleter,
+            "hint": hint,
         })
 
     return categories
@@ -907,6 +1274,172 @@ def parse_category_selection(raw: str, count: int) -> List[int]:
     return parse_selection(raw, count)
 
 
+def print_info() -> None:
+    """Print info about why disk fills up and how to use auto-clean."""
+    print(f"""
+{'─' * 65}
+  Why does my disk fill up again?
+{'─' * 65}
+  macOS and apps continuously regenerate caches, logs, and temp files.
+  The biggest culprits:
+
+  - Browser caches     — Chrome/Safari rebuild 2-5 GB within days
+  - System logs (ASL)  — macOS writes continuously, can grow to GBs
+  - Diagnostic reports — crash logs accumulate silently
+  - iCloud sync cache  — re-downloads files as you access them
+  - Spotlight index    — rebuilds after cache clears
+  - Swap/VM files      — grow under memory pressure (freed on restart)
+
+  To keep disk clean automatically, set up auto-clean:
+  From main menu: press 's' to configure a schedule
+  Or run: disk-cleaner --schedule weekly
+{'─' * 65}
+""")
+
+
+def interactive_schedule_setup(config: dict) -> None:
+    """Interactive schedule configuration from the main menu."""
+    if disk_cleaner_schedule is None:
+        print("  Schedule module not found. Reinstall disk-cleaner to enable scheduling.")
+        return
+
+    print(f"\n{'─' * 65}")
+    print("  Auto-Clean Setup")
+    print(f"{'─' * 65}\n")
+
+    print("  Frequency:")
+    print("    [1] Daily")
+    print("    [2] Weekly")
+    print("    [3] Monthly")
+    while True:
+        try:
+            freq_input = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if freq_input == "1":
+            frequency = "daily"
+            break
+        elif freq_input == "2":
+            frequency = "weekly"
+            break
+        elif freq_input == "3":
+            frequency = "monthly"
+            break
+        print("  Please enter 1, 2, or 3.")
+
+    day = "sunday"
+    if frequency == "weekly":
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        print("\n  Day:")
+        for i, d in enumerate(day_names, 1):
+            print(f"    [{i}] {d.capitalize()}")
+        while True:
+            try:
+                day_input = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.")
+                return
+            try:
+                day_idx = int(day_input) - 1
+                if 0 <= day_idx < 7:
+                    day = day_names[day_idx]
+                    break
+            except ValueError:
+                pass
+            print("  Please enter 1-7.")
+
+    print("\n  Time (24h format, e.g. 03:00):")
+    while True:
+        try:
+            time_input = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if len(time_input) >= 3 and ":" in time_input:
+            try:
+                h, m = [int(x) for x in time_input.split(":")]
+                if 0 <= h <= 23 and 0 <= m <= 59:
+                    time_str = f"{h:02d}:{m:02d}"
+                    break
+            except ValueError:
+                pass
+        print("  Please enter time in HH:MM format (e.g. 03:00).")
+
+    print("\n  Categories that will be auto-cleaned (safe only):")
+    safe_names = [
+        "Trash", "Dev caches", "Xcode caches", "Android SDK (old)",
+        "JetBrains / IDE", "VS Code caches", "Language toolchains",
+        "System logs", "Saved app state", "Browser caches",
+        "iCloud local cache", "Diagnostic reports", "CocoaPods cache",
+        "Composer cache (PHP)", "Ruby gems cache", "NuGet cache (.NET)",
+    ]
+    for name in safe_names:
+        print(f"    [ok] {name}")
+
+    print()
+    if not confirm("  Include all safe categories?"):
+        print("  Cancelled.")
+        return
+
+    config["schedule"] = {
+        "enabled": True,
+        "frequency": frequency,
+        "day": day,
+        "time": time_str,
+        "categories": "safe-only",
+    }
+    save_config(config)
+
+    if disk_cleaner_schedule.install_schedule(config):
+        freq_display = frequency
+        if frequency == "weekly":
+            freq_display = f"every {day.capitalize()}"
+        elif frequency == "monthly":
+            freq_display = "monthly (1st)"
+        print(f"\n  Schedule installed: {freq_display} at {time_str}")
+        print(f"  Plist: ~/Library/LaunchAgents/com.diskcleaner.auto.plist")
+        print(f"  Logs:  ~/Library/Logs/DiskCleaner/")
+        log_action(f"Schedule installed: {freq_display} at {time_str}")
+    else:
+        print("\n  Failed to install schedule.")
+    print()
+
+
+def run_auto_clean() -> None:
+    """Non-interactive mode: clean only safe categories, skip sudo, log everything."""
+    global DRY_RUN
+
+    config = init_config()
+    cleanup_old_logs(config.get("log_retention_days", 30))
+
+    log_action("AUTO-CLEAN started")
+    print("Auto-clean: scanning...")
+
+    categories = build_categories()
+
+    total_freed = 0
+    for cat in categories:
+        if not cat["safe"]:
+            continue
+        if not cat["items"]:
+            continue
+        # Skip categories that require sudo (can't prompt in auto mode)
+        if cat["deleter"] in (delete_with_sudo, delete_spotlight_rebuild, delete_apfs_snapshots):
+            log_action(f"Skipped: {cat['name']} (requires sudo)")
+            continue
+
+        freed = cat["deleter"](cat["items"])
+        total_freed += freed
+        if freed:
+            log_action(f"Cleaned: {cat['name']} — freed {format_size(freed)}")
+
+    usage = shutil.disk_usage(HOME)
+    summary = f"AUTO-CLEAN complete — freed {format_size(total_freed)} — disk free: {format_size(usage.free)} / {format_size(usage.total)}"
+    log_action(summary)
+    print(f"  {summary}")
+
+
 def main() -> None:
     global DRY_RUN
 
@@ -916,8 +1449,63 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be deleted without actually deleting anything")
+    parser.add_argument("--auto-clean", action="store_true",
+                        help="Run non-interactive cleanup of safe categories only (used by scheduler)")
+    parser.add_argument("--schedule", nargs="?", const="interactive", default=None,
+                        metavar="FREQ",
+                        help="Set up auto-clean schedule (daily/weekly/monthly or interactive)")
+    parser.add_argument("--day", default="sunday",
+                        help="Day for weekly schedule (default: sunday)")
+    parser.add_argument("--time", default="03:00", dest="schedule_time",
+                        help="Time for schedule in HH:MM format (default: 03:00)")
+    parser.add_argument("--unschedule", action="store_true",
+                        help="Remove auto-clean schedule")
+    parser.add_argument("--schedule-status", action="store_true",
+                        help="Show current auto-clean schedule status")
     args = parser.parse_args()
     DRY_RUN = args.dry_run
+
+    if args.auto_clean:
+        run_auto_clean()
+        return
+
+    if args.schedule_status:
+        if disk_cleaner_schedule:
+            disk_cleaner_schedule.show_schedule_status()
+        else:
+            print("  Schedule module not available.")
+        return
+
+    if args.unschedule:
+        if disk_cleaner_schedule:
+            disk_cleaner_schedule.uninstall_schedule()
+            log_action("Schedule removed")
+        else:
+            print("  Schedule module not available.")
+        return
+
+    if args.schedule is not None:
+        config = init_config()
+        if args.schedule == "interactive":
+            interactive_schedule_setup(config)
+            return
+        config["schedule"] = {
+            "enabled": True,
+            "frequency": args.schedule,
+            "day": args.day,
+            "time": args.schedule_time,
+            "categories": "safe-only",
+        }
+        save_config(config)
+        if disk_cleaner_schedule and disk_cleaner_schedule.install_schedule(config):
+            print(f"  Schedule installed: {args.schedule} at {args.schedule_time}")
+            log_action(f"Schedule installed: {args.schedule} at {args.schedule_time}")
+        else:
+            print("  Failed to install schedule.")
+        return
+
+    config = init_config()
+    cleanup_old_logs(config.get("log_retention_days", 30))
 
     if DRY_RUN:
         print("\n  ** DRY-RUN MODE — nothing will be deleted **")
@@ -930,19 +1518,23 @@ def main() -> None:
     categories = build_categories()
 
     total_freed = 0
+    show_all = False
 
     while True:
         print()
-        print_summary_table(categories)
+        index_map = print_summary_table(categories, show_all=show_all)
 
-        while True:
+        selected_indices = None
+        while selected_indices is None:
             try:
-                raw = input("  Select categories to clean (e.g. 1,2,3 or 'all' or 'q' to quit): ").strip()
+                raw = input("  Select categories (e.g. 1,2 / 'all' / 'a' show all / 's' schedule / 'i' info / 'q' quit): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n  Aborted.")
                 return
 
-            if raw.lower() in ("q", "quit", "exit"):
+            low = raw.lower()
+
+            if low in ("q", "quit", "exit"):
                 print("  Goodbye.")
                 if total_freed:
                     print(f"\n{'═' * 65}")
@@ -955,11 +1547,32 @@ def main() -> None:
                     print(f"{'═' * 65}\n")
                 return
 
-            selected_indices = parse_category_selection(raw, len(categories))
-            if not selected_indices:
+            if low == "a":
+                show_all = not show_all
+                print()
+                index_map = print_summary_table(categories, show_all=show_all)
+                continue
+
+            if low == "i":
+                print_info()
+                continue
+
+            if low == "s":
+                interactive_schedule_setup(config)
+                continue
+
+            # Parse selection against visible categories
+            if low == "all":
+                selected_display = list(range(len(index_map)))
+            else:
+                selected_display = parse_selection(low, len(index_map))
+
+            if not selected_display:
                 print("  No valid categories selected. Try again or 'q' to quit.\n")
                 continue
-            break
+
+            # Map display indices back to actual category indices
+            selected_indices = [index_map[d] for d in selected_display]
 
         went_back = False
 
@@ -967,6 +1580,8 @@ def main() -> None:
             cat = categories[idx]
             print(f"\n{'─' * 65}")
             print(f"  Category: {cat['name']}  ({format_size(cat['total_size'])} reclaimable)")
+            if cat.get("hint"):
+                print(f"  {dim(cat['hint'])}")
             print(f"{'─' * 65}")
 
             items = cat["items"]
@@ -978,7 +1593,7 @@ def main() -> None:
             if cat["deleter"] is delete_docker:
                 print(f"  Docker usage breakdown:")
                 for path, size, label in items:
-                    print(f"    • {label}: {format_size(size)}")
+                    print(f"    \u2022 {label}: {format_size(size)}")
                 print()
                 freed = delete_docker(items)
                 total_freed += freed
@@ -989,7 +1604,7 @@ def main() -> None:
             # Info-only categories (e.g. swap/sleep) — display and skip
             if cat["deleter"] is delete_info_only:
                 for path, size, label in items:
-                    print(f"    • {label}: {format_size(size)}")
+                    print(f"    \u2022 {label}: {format_size(size)}")
                 print()
                 print("  These items are freed automatically on restart. No action taken.")
                 continue
@@ -1005,7 +1620,7 @@ def main() -> None:
             total_sel = sum(s for _, s, _ in selected_items)
             print(f"\n  Items to delete ({len(selected_items)} item(s), {bold(format_size(total_sel))}):")
             for path, size, label in selected_items:
-                print(f"    • {label} ({bold(format_size(size))})")
+                print(f"    \u2022 {label} ({bold(format_size(size))})")
                 print(f"      {dim(hyperlink(path))}")
             print()
             if not confirm("  Proceed?"):
@@ -1020,16 +1635,44 @@ def main() -> None:
             print("\n  Returning to main menu...\n")
             continue
 
-        # Finished all selected categories without going back
-        print(f"\n{'═' * 65}")
+        # Show round summary inline
+        print(f"\n{'─' * 65}")
         if DRY_RUN:
-            print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+            print(f"  [dry-run] Session total so far: {format_size(total_freed)}")
         else:
-            print(f"  Total freed: {format_size(total_freed)}")
+            print(f"  Session total freed so far: {format_size(total_freed)}")
             new_usage = shutil.disk_usage(HOME)
             print(f"  Disk free now: {format_size(new_usage.free)} / {format_size(new_usage.total)}")
-        print(f"{'═' * 65}\n")
-        return
+        print(f"{'─' * 65}")
+
+        # Post-round prompt — return to menu instead of exiting
+        while True:
+            try:
+                post = input("\n  Press 'r' to re-scan, 'q' to quit, or Enter to continue: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Aborted.")
+                return
+            if post in ("q", "quit"):
+                print("  Goodbye.")
+                if total_freed:
+                    print(f"\n{'═' * 65}")
+                    if DRY_RUN:
+                        print(f"  [dry-run] Would have freed: {format_size(total_freed)}")
+                    else:
+                        print(f"  Total freed: {format_size(total_freed)}")
+                        final_usage = shutil.disk_usage(HOME)
+                        print(f"  Disk free now: {format_size(final_usage.free)} / {format_size(final_usage.total)}")
+                    print(f"{'═' * 65}\n")
+                return
+            if post == "r":
+                print("\n\U0001f50d Re-scanning your disk...\n")
+                usage = shutil.disk_usage(HOME)
+                print_header(usage.free, usage.total)
+                categories = build_categories()
+                break
+            if post == "":
+                break
+            print("  Invalid input. Press 'r', Enter, or 'q'.")
 
 
 if __name__ == "__main__":
